@@ -1523,11 +1523,12 @@ export class FloorplanViewer {
     setLightLook(light);
     if (this.building?.floors.some((f) => f.furniture.some((m) => m.type === "waste_bin" || hasFixedColors(m.type)))) this.rebuild();
     const blending = lineBlending(theme);
-    const lineMats = [...this.floors.map((f) => f.materials.lines), ...(this.roof ? [this.roof.lines] : []), ...(this.model?.lines ?? [])];
+    const lineMats = [...this.floors.map((f) => f.materials.lines), ...(this.roof ? [this.roof.lines] : [])];
     for (const m of lineMats) {
       m.blending = blending;
       m.needsUpdate = true;
     }
+    this.styleModel();
     // the neon ground grid would vanish on the light background anyway
     this.placeGround();
     this.buildSunFx();
@@ -1560,6 +1561,7 @@ export class FloorplanViewer {
     const fixedColours = this.lightLookOn !== lightBefore && !!this.building?.floors.some((f) => f.furniture.some((m) => m.type === "waste_bin" || hasFixedColors(m.type)));
     if (rebuild || fixedColours) this.rebuild();
     else this.styleFloors();
+    this.styleModel();
     this.placeGround();
     this.invalidate();
   }
@@ -3168,14 +3170,24 @@ export class FloorplanViewer {
     const sig = JSON.stringify([floors, this.lowQuality]);
     if (sig !== this.modelSig || !this.model) {
       this.model?.dispose();
-      this.model = new ModelLayer(parts, this.modelOpts, floors, { theme: this.themeUniform, lineBlending: lineBlending(this.theme), low: this.lowQuality });
+      this.model = new ModelLayer(parts, this.modelOpts, floors, { theme: this.themeUniform, lineBlending: lineBlending(this.theme), low: this.lowQuality, onChange: () => this.invalidate() });
       this.modelSig = sig;
       this.root.add(this.model.group);
       this.renderer.localClippingEnabled = true;
-    } else this.model.restyle();
+    }
+    this.styleModel();
     for (const fv of this.floors) this.model.placeFloor(fv.floor.id, fv.group.position.y, fv.o);
     this.applyModelCut();
     this.invalidate();
+  }
+
+  /**
+   * The model's look: shaded in its own colours with thin dark edges, like a CAD viewer, in the light looks (the day
+   * look, its palettes such as the architect's model) and with natural materials (evening styles dim it warm); in the
+   * neon looks it keeps the neon kinds' colours.
+   */
+  private styleModel(): void {
+    this.model?.restyle(this.style.natural === true || this.style.base === "day", lineBlending(this.theme));
   }
 
   /** What of the model reaches above the opened floor is cut away (the floors above fly off with their parts). */

@@ -4,6 +4,11 @@ All notable changes to NeonPlan 3D. The full notes in German and English are on 
 [releases page](https://github.com/Mastershort/neonplan3d/releases). Ideas and votes:
 [Discussions → Ideas](https://github.com/Mastershort/neonplan3d/discussions/categories/ideas).
 
+## 3.1.4
+
+### Under the hood
+- **Detailed model layer (preview, off):** the model now looks like a CAD viewer in the light and natural styles: its own colours (wood, glass, dark frames), soft light from the sky and the sun on every face, darker wall feet and thin dark edges. The evening styles dim it warm; the neon looks keep it neon. Edges are drawn in small steps after the model shows, so a large model does not stall the page. Still switched off for everyone.
+
 ## 3.1.3
 
 ### Under the hood

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AdditiveBlending } from "three";
-import { floorOf, modelKind, ModelLayer, needsMeshopt, readModel, type LayerFloor, type ModelPart } from "./model-layer.ts";
+import { AdditiveBlending, NormalBlending } from "three";
+import { floorOf, modelEdges, modelKind, ModelLayer, modelShade, needsMeshopt, readModel, shadedColour, type LayerFloor, type ModelPart } from "./model-layer.ts";
 
 // ------------------------------------------------------------------ an invented GLB, written here
 
@@ -166,4 +166,91 @@ test("the layer batches per floor, follows the floors and cuts above the opened 
   const low = new ModelLayer(parts, {}, FLOORS, { theme: { value: 0 }, lineBlending: AdditiveBlending, low: true });
   assert.equal(low.lines.length, 0);
   low.dispose();
+});
+
+// ------------------------------------------------------------------ the shaded look
+
+test("the shaded look lights every face direction differently, tops brightest, undersides darkest", () => {
+  const up = modelShade([0, 1, 0]);
+  const down = modelShade([0, -1, 0]);
+  const sides = [modelShade([-1, 0, 0]), modelShade([0, 0, 1]), modelShade([1, 0, 0]), modelShade([0, 0, -1])];
+  for (const s of sides) {
+    assert.ok(s < up, "a side is darker than a top");
+    assert.ok(s > down, "a side is lighter than an underside");
+  }
+  // the sun stands front left: the two sides turned to it differ from each other and from the two turned away
+  assert.ok(sides[0] > sides[1] && sides[1] > sides[2]);
+  assert.equal(sides[2], sides[3], "faces turned away from the sun only get the sky");
+  assert.ok(up > 0.85 && up <= 1.05, "a top stays about as light as its colour");
+  assert.ok(down > 0.1 && down < 0.35, "an underside is dark, not black");
+  for (const n of [[0.6, 0.8, 0], [0, -0.6, 0.8], [0.48, 0.6, 0.64]] as [number, number, number][]) {
+    const k = modelShade(n);
+    assert.ok(k >= down && k <= up + 1e-9, `${n} lies between underside and top`);
+  }
+});
+
+test("the feet of walls are darker, fading out within 60 cm; floors and ceilings are not", () => {
+  const side: [number, number, number] = [1, 0, 0];
+  const free = modelShade(side);
+  assert.ok(modelShade(side, 0) < free * 0.75);
+  assert.ok(modelShade(side, 0.3) > modelShade(side, 0) && modelShade(side, 0.3) < free);
+  assert.equal(modelShade(side, 0.6), free);
+  assert.equal(modelShade(side, 2), free);
+  assert.equal(modelShade([0, 1, 0], 0), modelShade([0, 1, 0]), "a floor is not darkened");
+});
+
+test("the shaded look lifts light greys to white, keeps dark greys and real colours", () => {
+  const close = (a: number[], b: number[]) => a.every((v, i) => Math.abs(v - b[i]) < 1e-9);
+  const grey = shadedColour([0.5, 0.5, 0.5]);
+  assert.ok(grey[0] > 0.8 && grey[0] < 1, "Revit's default grey turns light grey");
+  assert.ok(Math.abs(grey[0] - grey[2]) < 1e-9, "a grey stays grey");
+  assert.ok(close(shadedColour([0.06, 0.06, 0.07]), [0.06, 0.06, 0.07]), "solar panels stay black");
+  assert.ok(close(shadedColour([0.75, 0.525, 0.415]), [0.75, 0.525, 0.415]), "wood stays brown");
+  assert.ok(close(shadedColour([1, 1, 1]), [1, 1, 1]));
+  assert.ok(shadedColour([0.8, 0.8, 0.8])[0] > shadedColour([0.5, 0.5, 0.5])[0], "the order of greys is kept");
+});
+
+test("edges: a box shows its 12 edges, a flat quad its border, a smooth curve none of its seams", () => {
+  // a box with shared corners
+  const box = new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]);
+  const quads = [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [3, 7, 6, 2], [0, 4, 7, 3], [1, 2, 6, 5]];
+  const index = new Uint32Array(quads.flatMap(([a, b, c, d]) => [a, b, c, a, c, d]));
+  assert.equal(modelEdges(box, index).length / 6, 12, "no diagonals of the faces");
+  // the same box with every face's corners on their own (as exporters write flat shading): welded, the same edges
+  const split: number[] = [];
+  const splitIndex: number[] = [];
+  for (const q of quads) {
+    const base = split.length / 3;
+    for (const v of q) split.push(box[v * 3], box[v * 3 + 1], box[v * 3 + 2]);
+    splitIndex.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
+  assert.equal(modelEdges(new Float32Array(split), new Uint32Array(splitIndex)).length / 6, 12);
+  // one flat quad: its four borders
+  assert.equal(modelEdges(new Float32Array([0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1]), new Uint32Array([0, 1, 2, 0, 2, 3])).length / 6, 4);
+  // a half cylinder in 10° steps: the seams between its strips stay hidden, its two ends and long borders show
+  const pos: number[] = [];
+  const idx: number[] = [];
+  for (let i = 0; i <= 18; i++) {
+    const a = (i * Math.PI) / 18;
+    pos.push(Math.cos(a), Math.sin(a), 0, Math.cos(a), Math.sin(a), 2);
+    if (i) idx.push((i - 1) * 2, i * 2, i * 2 + 1, (i - 1) * 2, i * 2 + 1, (i - 1) * 2 + 1);
+  }
+  assert.equal(modelEdges(new Float32Array(pos), new Uint32Array(idx)).length / 6, 18 * 2 + 2);
+  // degenerate input
+  assert.equal(modelEdges(new Float32Array(0), new Uint32Array(0)).length, 0);
+});
+
+test("the layer finds its edges after it is shown and draws them dark in the shaded look", async () => {
+  const parts = readModel(glb(HOUSE));
+  let changes = 0;
+  const layer = new ModelLayer(parts, {}, FLOORS, { theme: { value: 0 }, lineBlending: AdditiveBlending, low: false, onChange: () => changes++ });
+  await layer.edgesDone;
+  assert.ok(layer.lines.length > 0 && changes === layer.lines.length);
+  assert.ok(layer.lines.every((m) => m.blending === AdditiveBlending), "neon edges glow");
+  layer.restyle(true, AdditiveBlending);
+  assert.equal(layer.shaded, true);
+  assert.ok(layer.lines.every((m) => m.blending === NormalBlending), "dark edges are drawn normally");
+  layer.restyle(false, AdditiveBlending);
+  assert.ok(layer.lines.every((m) => m.blending === AdditiveBlending));
+  layer.dispose();
 });

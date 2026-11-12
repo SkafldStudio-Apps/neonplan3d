@@ -6,14 +6,15 @@
 // positions, indices, node transforms, base colours and the nodes' extras {category, level, name}. Its container and
 // accessor logic follows the importer's readGltf (import/mesh.ts). Meshopt-compressed buffers (EXT_meshopt_compression)
 // are decoded with meshoptimizer's decoder, which the caller loads lazily as a chunk of its own only when a file
-// needs it. Textures, normals and PBR are ignored: every look recolours surfaces in the shader (theme.ts).
+// needs it. Textures, normals and PBR are ignored: the neon looks recolour surfaces in the shader (theme.ts); the light
+// looks draw the model's own colours shaded like a CAD viewer (soft sun from one side, a sky above, darker undersides and
+// wall feet), lit from the face's direction in the shader – no normals, no lights, no extra shader chunks.
 //
 // Parts are grouped per NeonPlan floor (from the file they came in, their extras' level, or else their height), so
 // they rise, fade and fan out with that floor; a clipping plane cuts what reaches above the opened floor.
 
-import { BufferGeometry, EdgesGeometry, Float32BufferAttribute, Group, LineBasicMaterial, LineSegments, Matrix4, Mesh, MeshBasicMaterial, Plane, Quaternion, Uint32BufferAttribute, Vector3, type Blending } from "three";
-import { themed, type ThemeUniform } from "./theme.ts";
-import { naturalPalette } from "./palette.ts";
+import { BufferGeometry, Float32BufferAttribute, Group, LineBasicMaterial, LineSegments, Matrix4, Mesh, MeshBasicMaterial, NormalBlending, Plane, Quaternion, Uint32BufferAttribute, Vector3, type Blending, type Material } from "three";
+import { floorLevelUniform, themed, type ThemeUniform } from "./theme.ts";
 
 /** meshoptimizer's decoder (three/examples/jsm/libs/meshopt_decoder.module.js), as far as it is used here. */
 export interface MeshoptDecoderLike {
@@ -331,8 +332,165 @@ const NEON_KIND: Record<ModelKind, number> = {
 /** Edges drawn per kind in neon (the plan's cyan, softer on what is not built). */
 const EDGE_KIND: Partial<Record<ModelKind, number>> = { wall: 0x37e0ff, slab: 0x37e0ff, roof: 0x37e0ff, stair: 0x37e0ff, rail: 0x5b7cff, window: 0x5b7cff, door: 0x5b7cff, frame: 0x5b7cff, glass: 0x5b7cff, furniture: 0x3a4f80, other: 0x37e0ff, water: 0x37e0ff };
 
-const lin2srgb = (c: number) => (c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
-const hexOf = (c: [number, number, number]) => (Math.round(lin2srgb(c[0]) * 255) << 16) | (Math.round(lin2srgb(c[1]) * 255) << 8) | Math.round(lin2srgb(c[2]) * 255);
+// Base colours are taken as display colours: Revit models converted through Autodesk's viewer format (svf-utils) carry
+// the Revit appearance colours unconverted, and the Autodesk viewer shows them as such (wood doors #bf866a stay brown).
+const hexOf = (c: readonly number[]) => (Math.round(Math.min(1, Math.max(0, c[0])) * 255) << 16) | (Math.round(Math.min(1, Math.max(0, c[1])) * 255) << 8) | Math.round(Math.min(1, Math.max(0, c[2])) * 255);
+
+/**
+ * A model colour as the shaded look draws it: greys from mid-tone up are lifted towards white (Revit's default grey
+ * #7f7f7f reads as the light grey of a CAD viewer's solids), dark greys (glass frames, solar panels) and real colours
+ * (wood, plaster tints) stay as they are.
+ */
+export function shadedColour(c: readonly [number, number, number]): [number, number, number] {
+  const mx = Math.max(c[0], c[1], c[2]);
+  const mn = Math.min(c[0], c[1], c[2]);
+  const sat = mx > 0 ? (mx - mn) / mx : 0;
+  const t = Math.min(1, Math.max(0, (mx - 0.2) / 0.25));
+  const lift = 0.7 * t * t * (3 - 2 * t) * (1 - Math.min(1, Math.max(0, (sat - 0.08) / 0.12)));
+  return [c[0] + (1 - c[0]) * lift, c[1] + (1 - c[1]) * lift, c[2] + (1 - c[2]) * lift];
+}
+
+/** Glass in the shaded look: dark and see-through, as a CAD viewer draws it. */
+const SHADED_GLASS = 0x1f2429;
+const SHADED_GLASS_OPACITY = 0.38;
+
+// ------------------------------------------------------------------ shading
+
+/** Where the sun comes from in the shaded look (unit vector, y up): high, from the front left. */
+export const SHADE_SUN: readonly [number, number, number] = [-0.597, 0.697, 0.398];
+/** Light of the sky on faces turned up, of the ground on faces turned down, and how much the sun adds (linear). */
+export const SHADE_SKY = 0.7;
+export const SHADE_GROUND = 0.2;
+export const SHADE_SUN_K = 0.32;
+/** How much darker the feet of walls are, fading out over this height (m). */
+export const SHADE_AO = 0.3;
+export const SHADE_AO_HEIGHT = 0.6;
+
+/**
+ * The light on a face of the shaded look (a factor on its linear colour): a sky from above, the ground's darker light
+ * from below and a soft sun from one side, so every face direction reads differently. `n`: the face's unit normal;
+ * `above`: how far the point lies above its floor (m), for the darker feet of walls (null: no floor). Mirrored by the
+ * shader in SHADE_GLSL.
+ */
+export function modelShade(n: readonly [number, number, number], above: number | null = null): number {
+  const sun = Math.max(0, n[0] * SHADE_SUN[0] + n[1] * SHADE_SUN[1] + n[2] * SHADE_SUN[2]);
+  let k = SHADE_GROUND + (SHADE_SKY - SHADE_GROUND) * (0.5 + 0.5 * n[1]) + SHADE_SUN_K * sun;
+  if (above !== null && Math.abs(n[1]) < 0.5) {
+    const t = Math.min(1, Math.max(0, above / SHADE_AO_HEIGHT));
+    k *= 1 - SHADE_AO * (1 - t * t * (3 - 2 * t));
+  }
+  return k;
+}
+
+const f = (v: number) => v.toFixed(4);
+const SHADE_GLSL = `
+uniform float uModelShade;
+vec3 fp3dModelShade(vec3 c) {
+  vec3 n = fp3dFaceNormal();
+  float k = mix(${f(SHADE_GROUND)}, ${f(SHADE_SKY)}, 0.5 + 0.5 * n.y) + ${f(SHADE_SUN_K)} * max(dot(n, vec3(${SHADE_SUN.map(f).join(", ")})), 0.0);
+  if (uFloorY > -999.0 && abs(n.y) < 0.5) k *= 1.0 - ${f(SHADE_AO)} * (1.0 - smoothstep(0.0, ${f(SHADE_AO_HEIGHT)}, vFp3dWorld.y - uFloorY));
+  c *= k;
+  // evening styles: the model dims warm like the house
+  if (uStDim > 0.0) c *= mix(vec3(1.0), vec3(0.62, 0.52, 0.42), uStDim) * (1.0 - 0.75 * uStDim);
+  return c;
+}
+`;
+
+/**
+ * A themed material that draws shaded (surfaces) or as thin dark lines (edges) while `shade` is 1, and in the look's
+ * colours otherwise. Builds on themed()'s patch: same varyings and uniforms, one more branch.
+ */
+function shadable<T extends Material>(material: T, theme: ThemeUniform, shade: { value: number }, line: boolean): T {
+  themed(material, theme, line);
+  const before = material.onBeforeCompile.bind(material);
+  const key = material.customProgramCacheKey.bind(material);
+  material.onBeforeCompile = (shader, renderer) => {
+    before(shader, renderer);
+    shader.uniforms.uModelShade = shade;
+    const call = `fp3dThemed(diffuseColor.rgb, ${line}, true)`;
+    shader.fragmentShader = shader.fragmentShader.replace("void main() {", `${SHADE_GLSL}\nvoid main() {`).replace(call, `(uModelShade > 0.5 ? ${line ? "vec3(0.025)" : "fp3dModelShade(diffuseColor.rgb)"} : ${call})`);
+  };
+  material.customProgramCacheKey = () => `${key()}-model`;
+  return material;
+}
+
+// ------------------------------------------------------------------ edges
+
+/**
+ * The edges worth drawing of one part (flat line pairs): where its faces meet at more than `angle` degrees, and its
+ * open borders. Like three's EdgesGeometry, but with vertices welded on a 1 mm grid under number keys, which is several
+ * times faster on a model of a million triangles.
+ */
+export function modelEdges(positions: Float32Array, index: Uint32Array, angle = 28): Float32Array {
+  const nv = positions.length / 3;
+  if (!nv || index.length < 3) return new Float32Array(0);
+  let x0 = Infinity, y0 = Infinity, z0 = Infinity, ext = 0;
+  for (let i = 0; i < positions.length; i += 3) {
+    if (positions[i] < x0) x0 = positions[i];
+    if (positions[i + 1] < y0) y0 = positions[i + 1];
+    if (positions[i + 2] < z0) z0 = positions[i + 2];
+  }
+  for (let i = 0; i < positions.length; i += 3) ext = Math.max(ext, positions[i] - x0, positions[i + 1] - y0, positions[i + 2] - z0);
+  // 1 mm, coarser for parts so big that three coordinates would not fit one safe integer
+  const SPAN = 131071;
+  const q = Math.max(0.001, ext / SPAN);
+  const weld = new Map<number, number>();
+  const id = new Uint32Array(nv);
+  const first: number[] = [];
+  for (let i = 0; i < nv; i++) {
+    const k = (Math.round((positions[i * 3] - x0) / q) * (SPAN + 1) + Math.round((positions[i * 3 + 1] - y0) / q)) * (SPAN + 1) + Math.round((positions[i * 3 + 2] - z0) / q);
+    let w = weld.get(k);
+    if (w === undefined) {
+      w = first.length;
+      weld.set(k, w);
+      first.push(i);
+    }
+    id[i] = w;
+  }
+  const cos = Math.cos((angle * Math.PI) / 180);
+  const nt = Math.floor(index.length / 3);
+  const normals = new Float32Array(nt * 3);
+  /** edge key → triangle + 1 that has it so far; -1 once settled */
+  const open = new Map<number, number>();
+  const out: number[] = [];
+  const nw = first.length;
+  const emit = (a: number, b: number) => {
+    const pa = first[a] * 3;
+    const pb = first[b] * 3;
+    out.push(positions[pa], positions[pa + 1], positions[pa + 2], positions[pb], positions[pb + 1], positions[pb + 2]);
+  };
+  for (let t = 0; t < nt; t++) {
+    const ia = index[t * 3], ib = index[t * 3 + 1], ic = index[t * 3 + 2];
+    const a = id[ia], b = id[ib], c = id[ic];
+    if (a === b || b === c || a === c) continue;
+    const ux = positions[ib * 3] - positions[ia * 3], uy = positions[ib * 3 + 1] - positions[ia * 3 + 1], uz = positions[ib * 3 + 2] - positions[ia * 3 + 2];
+    const vx = positions[ic * 3] - positions[ia * 3], vy = positions[ic * 3 + 1] - positions[ia * 3 + 1], vz = positions[ic * 3 + 2] - positions[ia * 3 + 2];
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const len = Math.hypot(nx, ny, nz);
+    if (len < 1e-12) continue;
+    nx /= len;
+    ny /= len;
+    nz /= len;
+    normals[t * 3] = nx;
+    normals[t * 3 + 1] = ny;
+    normals[t * 3 + 2] = nz;
+    for (let e = 0; e < 3; e++) {
+      const p = e === 0 ? a : e === 1 ? b : c;
+      const r = e === 0 ? b : e === 1 ? c : a;
+      const key = p < r ? p * nw + r : r * nw + p;
+      const other = open.get(key);
+      if (other === undefined) open.set(key, t + 1);
+      else if (other > 0) {
+        const o = (other - 1) * 3;
+        if (normals[o] * nx + normals[o + 1] * ny + normals[o + 2] * nz <= cos) emit(p, r);
+        open.set(key, -1);
+      }
+    }
+  }
+  // borders: edges only one face has
+  for (const [key, t] of open) if (t > 0) emit(Math.floor(key / nw), key % nw);
+  return new Float32Array(out);
+}
 
 // ------------------------------------------------------------------ the layer
 
@@ -340,11 +498,15 @@ interface Batch {
   floorId: string | null;
   kind: ModelKind;
   color: number;
-  /** the model's own colour, used by the natural palette */
+  /** the model's own colour, used by the shaded look */
   own: number;
   opacity: number;
   mesh: Mesh<BufferGeometry, MeshBasicMaterial>;
-  edges: LineSegments<EdgesGeometry, LineBasicMaterial> | null;
+  edges: LineSegments<BufferGeometry, LineBasicMaterial> | null;
+  /** its parts in layer space, kept until its edges are found */
+  parts: { pos: Float32Array; index: Uint32Array }[] | null;
+  /** its floor's opacity, last set */
+  fade: number;
 }
 
 export interface LayerOptions {
@@ -352,10 +514,12 @@ export interface LayerOptions {
   lineBlending: Blending;
   /** The tablet level: no edges (they double what is drawn). */
   low: boolean;
+  /** Something new to draw (edges are found after the model is shown). */
+  onChange?: () => void;
 }
 
-/** Above this many triangles in one batch its edges are left out (finding them takes long on a big model). */
-const EDGE_TRIANGLES = 200_000;
+/** Edges are found a little at a time, so a big model never holds the page for long. */
+const EDGE_SLICE_MS = 12;
 
 export class ModelLayer {
   readonly group = new Group();
@@ -363,10 +527,19 @@ export class ModelLayer {
   private readonly batches: Batch[] = [];
   /** Cuts what reaches above the opened floor (constant far away while no floor is open). */
   private readonly cut = new Plane(new Vector3(0, -1, 0), 1e6);
+  /** 1 while the model is shaded in its own colours (light looks), 0 in the neon looks. */
+  private readonly shade = { value: 0 };
+  private readonly opt: LayerOptions;
+  private blending: Blending;
+  private disposed = false;
   readonly triangles: number;
+  /** Resolves once every edge is found (at once on the tablet level). */
+  readonly edgesDone: Promise<void>;
 
   constructor(parts: readonly ModelPart[], placement: ModelPlacement, floors: readonly LayerFloor[], opt: LayerOptions) {
+    this.opt = opt;
     this.group.name = "fp3d-model-layer";
+    this.blending = opt.lineBlending;
     const m = placementMatrix(placement);
     const tmp = new Vector3();
     // one batch per floor, kind and colour: a Revit model's thousands of nodes become a few dozen draw calls
@@ -374,6 +547,9 @@ export class ModelLayer {
     let triangles = 0;
     const elevation = new Map(floors.map((f) => [f.id, f.elevation]));
     for (const part of parts) {
+      const opacity = Math.round(part.opacity * 20) / 20;
+      // fully transparent materials (hidden helpers of the export) are not drawn at all
+      if (opacity <= 0) continue;
       const pos = new Float32Array(part.positions.length);
       let minY = Infinity;
       for (let i = 0; i < pos.length; i += 3) {
@@ -388,7 +564,6 @@ export class ModelLayer {
       const base = floorId ? (elevation.get(floorId) ?? 0) : 0;
       if (base) for (let i = 1; i < pos.length; i += 3) pos[i] -= base;
       const own: [number, number, number] = [Math.round(part.color[0] * 64) / 64, Math.round(part.color[1] * 64) / 64, Math.round(part.color[2] * 64) / 64];
-      const opacity = Math.round(part.opacity * 20) / 20;
       const key = `${floorId}|${part.kind}|${own.join(",")}|${opacity}`;
       let g = groups.get(key);
       if (!g) groups.set(key, (g = { floorId, kind: part.kind, own, opacity, parts: [] }));
@@ -414,20 +589,12 @@ export class ModelLayer {
       geo.setAttribute("position", new Float32BufferAttribute(pos, 3));
       geo.setIndex(new Uint32BufferAttribute(idx, 1));
       geo.computeBoundingSphere();
-      const own = hexOf(g.own);
       const color = NEON_KIND[g.kind];
       const transparent = g.opacity < 0.999;
-      const material = themed(new MeshBasicMaterial({ color, transparent, opacity: g.opacity, depthWrite: !transparent, clippingPlanes: [this.cut], polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }), opt.theme);
+      const material = shadable(new MeshBasicMaterial({ color, transparent, opacity: g.opacity, depthWrite: !transparent, clippingPlanes: [this.cut], polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }), opt.theme, this.shade, false);
       const mesh = new Mesh(geo, material);
       mesh.name = `fp3d-model-${g.kind}`;
       if (transparent) mesh.renderOrder = 4;
-      let edges: Batch["edges"] = null;
-      const edgeColour = EDGE_KIND[g.kind];
-      if (!opt.low && edgeColour !== undefined && idx.length / 3 <= EDGE_TRIANGLES) {
-        const line = themed(new LineBasicMaterial({ color: edgeColour, transparent: true, opacity: 0.7, blending: opt.lineBlending, depthWrite: false, clippingPlanes: [this.cut] }), opt.theme, true);
-        edges = new LineSegments(new EdgesGeometry(geo, 30), line);
-        edges.raycast = () => {};
-      }
       let holder = this.perFloor.get(g.floorId);
       if (!holder) {
         holder = new Group();
@@ -435,23 +602,99 @@ export class ModelLayer {
         this.group.add(holder);
       }
       holder.add(mesh);
-      if (edges) holder.add(edges);
-      this.batches.push({ floorId: g.floorId, kind: g.kind, color, own, opacity: g.opacity, mesh, edges });
+      const edged = !opt.low && EDGE_KIND[g.kind] !== undefined;
+      this.batches.push({ floorId: g.floorId, kind: g.kind, color, own: hexOf(shadedColour(g.own)), opacity: g.opacity, mesh, edges: null, parts: edged ? g.parts : null, fade: 1 });
     }
     for (const [id, holder] of this.perFloor) holder.position.y = id ? (elevation.get(id) ?? 0) : 0;
-    this.restyle();
+    this.restyle(false);
+    this.edgesDone = this.findEdges();
   }
 
-  /** Colours for the current palette: neon kinds (mapped by every look's shader), or the model's own in natural materials. */
-  restyle(): void {
-    const natural = naturalPalette();
-    for (const b of this.batches) {
-      // glass and water stay tinted in every look; the rest takes the model's colours in the natural palette
-      b.mesh.material.color.setHex(natural && b.kind !== "glass" ? b.own : b.color);
+  /**
+   * Finds the edges part by part, yielding to the page every few milliseconds; a batch's lines appear as soon as they
+   * are found. Opaque batches first, the biggest (walls, slabs, the white mass of the model) before the small ones.
+   */
+  private async findEdges(): Promise<void> {
+    const todo = this.batches.filter((b) => b.parts);
+    todo.sort((a, b) => Number(a.opacity < 0.999) - Number(b.opacity < 0.999) || b.mesh.geometry.index!.count - a.mesh.geometry.index!.count);
+    let slice = performance.now();
+    for (const b of todo) {
+      const found: Float32Array[] = [];
+      let n = 0;
+      for (const p of b.parts ?? []) {
+        if (performance.now() - slice > EDGE_SLICE_MS) {
+          await new Promise((r) => setTimeout(r, 0));
+          slice = performance.now();
+        }
+        if (this.disposed) return;
+        const e = modelEdges(p.pos, p.index);
+        found.push(e);
+        n += e.length;
+      }
+      b.parts = null;
+      if (!n) continue;
+      const pos = new Float32Array(n);
+      let off = 0;
+      for (const e of found) {
+        pos.set(e, off);
+        off += e.length;
+      }
+      const geo = new BufferGeometry();
+      geo.setAttribute("position", new Float32BufferAttribute(pos, 3));
+      geo.computeBoundingSphere();
+      const line = shadable(new LineBasicMaterial({ color: EDGE_KIND[b.kind], transparent: true, opacity: 0.7, blending: this.blending, depthWrite: false, clippingPlanes: [this.cut] }), this.opt.theme, this.shade, true);
+      b.edges = new LineSegments(geo, line);
+      b.edges.name = `fp3d-model-edges-${b.kind}`;
+      b.edges.raycast = () => {};
+      this.perFloor.get(b.floorId)?.add(b.edges);
+      this.paint(b);
+      this.opt.onChange?.();
     }
   }
 
-  /** The line materials (their blending follows the look, see FloorplanViewer.setTheme). */
+  /**
+   * The look: shaded in the model's own colours with thin dark edges (light looks, natural materials), or the neon
+   * kinds' colours that every look maps in the shader. `blending`: the look's line blending (for the neon edges).
+   */
+  restyle(shaded: boolean, blending: Blending = this.blending): void {
+    this.shade.value = shaded ? 1 : 0;
+    this.blending = blending;
+    for (const b of this.batches) this.paint(b);
+  }
+
+  /** Whether the model is drawn shaded now. */
+  get shaded(): boolean {
+    return this.shade.value === 1;
+  }
+
+  /** Colour, opacity and line blending of one batch for the current look and its floor's fade. */
+  private paint(b: Batch): void {
+    const shaded = this.shaded;
+    const glass = b.opacity < 0.999;
+    const mat = b.mesh.material;
+    // glass turns dark and see-through in the shaded look; the neon looks keep glass and water tinted
+    mat.color.setHex(shaded ? (glass ? SHADED_GLASS : b.own) : b.color);
+    const o = (shaded && glass ? SHADED_GLASS_OPACITY : b.opacity) * b.fade;
+    const transparent = o < 0.999;
+    if (mat.transparent !== transparent) {
+      mat.transparent = transparent;
+      mat.depthWrite = !transparent;
+      mat.needsUpdate = true;
+    }
+    mat.opacity = o;
+    if (b.edges) {
+      const line = b.edges.material;
+      // dark lines are drawn normally: added up they would vanish
+      const blend = shaded ? NormalBlending : this.blending;
+      if (line.blending !== blend) {
+        line.blending = blend;
+        line.needsUpdate = true;
+      }
+      line.opacity = (shaded ? (glass ? 0.25 : 0.5) : 0.7) * b.fade;
+    }
+  }
+
+  /** The line materials. */
   get lines(): LineBasicMaterial[] {
     return this.batches.flatMap((b) => (b.edges ? [b.edges.material] : []));
   }
@@ -464,15 +707,10 @@ export class ModelLayer {
     holder.visible = opacity > 0.02;
     for (const b of this.batches) {
       if (b.floorId !== floorId) continue;
-      const o = b.opacity * opacity;
-      const transparent = o < 0.999;
-      if (b.mesh.material.transparent !== transparent) {
-        b.mesh.material.transparent = transparent;
-        b.mesh.material.depthWrite = !transparent;
-        b.mesh.material.needsUpdate = true;
-      }
-      b.mesh.material.opacity = o;
-      if (b.edges) b.edges.material.opacity = 0.7 * opacity;
+      // the floor's level, for the darker wall feet of the shaded look
+      floorLevelUniform(b.mesh.material).value = y;
+      b.fade = opacity;
+      this.paint(b);
     }
   }
 
@@ -482,11 +720,13 @@ export class ModelLayer {
   }
 
   dispose(): void {
+    this.disposed = true;
     for (const b of this.batches) {
       b.mesh.geometry.dispose();
       b.mesh.material.dispose();
       b.edges?.geometry.dispose();
       b.edges?.material.dispose();
+      b.parts = null;
     }
     this.group.removeFromParent();
   }
