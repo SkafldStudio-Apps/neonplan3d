@@ -19,7 +19,9 @@ const common = {
   logLevel: "info",
 };
 
-const viewerConfig = { ...common, entryPoints: ["src/viewer/viewer3d.ts"], outfile: `${out}/neonplan3d-3d.js` };
+// meshoptimizer's decoder: loaded by the 3D bundle only when a model layer file is meshopt-compressed (spike)
+const meshoptConfig = { ...common, entryPoints: ["src/viewer/meshopt-entry.ts"], outfile: `${out}/neonplan3d-meshopt.js` };
+const viewerConfig = (meshoptHash) => ({ ...common, entryPoints: ["src/viewer/viewer3d.ts"], outfile: `${out}/neonplan3d-3d.js`, define: { __FP3D_MESHOPT_HASH__: JSON.stringify(meshoptHash) } });
 // the card's visual editor only loads in the dashboard's card dialog
 // the language files (lang/*.json) are fetched with a hash of their content, so a new text is never stale
 const LANGS = ["fr", "es", "nl", "it", "hu", "da", "sv", "nb", "nn", "fi", "cs", "pl", "ro", "sl", "sk", "zh", "pt"];
@@ -169,23 +171,25 @@ function copyFonts() {
 // main 756 KB, editor 970 KB, card editor 286 KB on 2026-11-02: the room bar (a card per room with a light switch, the favourites before them) with its texts
 // main 830 KB, 3D 870 KB, editor 1070 KB on 2026-11-05: duplicate floor, top-hung windows, camera pop-up, lift-and-slide doors
 // 3D 900 KB, editor 1100 KB, card editor 340 KB on 2026-11-11: the styles (palettes, natural materials, wall colours, contact shadows)
-const BUDGET = { "neonplan3d.js": 870 * 1024, "neonplan3d-fun.js": 40 * 1024, "neonplan3d-voice.js": 60 * 1024, "neonplan3d-locate.js": 160 * 1024, "neonplan3d-timetravel.js": 120 * 1024, "neonplan3d-3d.js": 900 * 1024, "neonplan3d-editor.js": 1100 * 1024, "neonplan3d-card-editor.js": 340 * 1024 };
+const BUDGET = { "neonplan3d.js": 870 * 1024, "neonplan3d-fun.js": 40 * 1024, "neonplan3d-voice.js": 60 * 1024, "neonplan3d-locate.js": 160 * 1024, "neonplan3d-timetravel.js": 120 * 1024, "neonplan3d-3d.js": 900 * 1024, "neonplan3d-editor.js": 1100 * 1024, "neonplan3d-card-editor.js": 340 * 1024, "neonplan3d-meshopt.js": 30 * 1024 };
 
 copyFonts();
 if (watch) {
   // in watch mode the hash is not tracked; a dev reload fetches the bundle anyway
-  for (const c of [viewerConfig, editorConfig("dev", "dev", "dev"), cardEditorConfig, timeTravelConfig, funConfig, voiceConfig, locateConfig, mainConfig("dev", "dev", "dev", "dev", "dev", "dev", "dev")]) await (await context(c)).watch();
+  for (const c of [meshoptConfig, viewerConfig("dev"), editorConfig("dev", "dev", "dev"), cardEditorConfig, timeTravelConfig, funConfig, voiceConfig, locateConfig, mainConfig("dev", "dev", "dev", "dev", "dev", "dev", "dev")]) await (await context(c)).watch();
 } else {
-  await build(viewerConfig);
+  await build(meshoptConfig);
+  const viewer = viewerConfig(hashOf(meshoptConfig.outfile));
+  await build(viewer);
   await build(locateConfig);
   await build(cardEditorConfig);
-  const editor = editorConfig(hashOf(viewerConfig.outfile), hashOf(locateConfig.outfile), hashOf(cardEditorConfig.outfile));
+  const editor = editorConfig(hashOf(viewer.outfile), hashOf(locateConfig.outfile), hashOf(cardEditorConfig.outfile));
   await build(editor);
   await build(timeTravelConfig);
   await build(funConfig);
   await build(voiceConfig);
   await build(importConfig);
-  await build(mainConfig(hashOf(viewerConfig.outfile), hashOf(editor.outfile), hashOf(cardEditorConfig.outfile), hashOf(timeTravelConfig.outfile), hashOf(funConfig.outfile), hashOf(voiceConfig.outfile), hashOf(locateConfig.outfile)));
+  await build(mainConfig(hashOf(viewer.outfile), hashOf(editor.outfile), hashOf(cardEditorConfig.outfile), hashOf(timeTravelConfig.outfile), hashOf(funConfig.outfile), hashOf(voiceConfig.outfile), hashOf(locateConfig.outfile)));
   let over = false;
   // old Fire-tablet WebViews (Chrome before 91, e.g. Fully Kiosk on a Fire 7) throw on an optional call with spread
   // arguments, `a?.b(...x)` – the roof failed there; lowering the target for it would cost ~11 KB, so it is banned

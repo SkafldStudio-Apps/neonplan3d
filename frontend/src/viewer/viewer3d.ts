@@ -24,6 +24,10 @@ import { pinKey } from "./pin-key.ts";
 import { roomLabelsShown } from "./label-room.ts";
 // the walk through the house at eye height (lives with the viewer it drives)
 export { FloorMap, WalkCamera, type WalkState } from "./walk.ts";
+// the model layer (spike, flags.ts MODEL_LAYER): a detailed GLB shown with the plan
+import { ModelLayer, needsMeshopt, readModel, type ModelLayerOptions, type ModelPart } from "./model-layer.ts";
+import { loadMeshopt } from "./load-meshopt.ts";
+export type { ModelLayerOptions } from "./model-layer.ts";
 
 /** three.js classes lent to the fun packs' bundle (so it carries no copy of three.js). */
 export const funLib = { Group, Mesh, MeshBasicMaterial, CanvasTexture, Color, PlaneGeometry, BufferGeometry: Geometry, Float32BufferAttribute, DoubleSide };
@@ -688,6 +692,12 @@ export class FloorplanViewer {
   private fanLast = 0;
   private fanTimer: ReturnType<typeof setTimeout> | undefined;
   private floorStack: FloorStack = "dim";
+  /** The model layer: its parts as read (kept, so a new plan or style only re-sorts them) and what is shown. */
+  private model: ModelLayer | null = null;
+  private modelParts: ModelPart[] | null = null;
+  private modelOpts: ModelLayerOptions | null = null;
+  private modelSig = "";
+  private modelLoad = 0;
   /** Floors by id, and per-frame bookkeeping so labels are only placed when something moved. */
   private floorMap = new Map<string, FloorView>();
   private labelsDirty = true;
@@ -916,6 +926,8 @@ export class FloorplanViewer {
     this.controls = this.makeControls();
     this.controls.view = view;
     this.resize();
+    // edges of the model layer only above the tablet level
+    this.buildModel();
   }
 
   /** Furniture packs (models of pack furniture); set before the building that uses them. */
@@ -1511,7 +1523,7 @@ export class FloorplanViewer {
     setLightLook(light);
     if (this.building?.floors.some((f) => f.furniture.some((m) => m.type === "waste_bin" || hasFixedColors(m.type)))) this.rebuild();
     const blending = lineBlending(theme);
-    const lineMats = [...this.floors.map((f) => f.materials.lines), ...(this.roof ? [this.roof.lines] : [])];
+    const lineMats = [...this.floors.map((f) => f.materials.lines), ...(this.roof ? [this.roof.lines] : []), ...(this.model?.lines ?? [])];
     for (const m of lineMats) {
       m.blending = blending;
       m.needsUpdate = true;
@@ -2351,6 +2363,9 @@ export class FloorplanViewer {
     this.controls.dispose();
     this.clear();
     this.disposeRetired();
+    this.model?.dispose();
+    this.model = null;
+    this.modelParts = null;
     this.building = null;
     this.buildRoofMesh();
     this.ground.geometry.dispose();
@@ -2399,6 +2414,8 @@ export class FloorplanViewer {
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, low ? 1 : quality === "high" ? 2.5 : 2));
     renderer.setClearColor(0x000000, 0);
     renderer.outputColorSpace = SRGBColorSpace;
+    // the model layer cuts what reaches above the opened floor with a clipping plane
+    renderer.localClippingEnabled = !!this.model;
     renderer.domElement.className = "fp3d-canvas";
     this.host.prepend(renderer.domElement);
     return renderer;
@@ -3103,6 +3120,68 @@ export class FloorplanViewer {
     this.buildSunFx();
     this.updateGhost();
     this.styleFloors();
+    this.buildModel();
+  }
+
+  /**
+   * Shows a detailed building model with the plan (null: none). Files are fetched from the URLs (served by Home
+   * Assistant, so nothing leaves the house); meshopt-compressed ones load the decoder's own bundle first.
+   * Resolves with the number of triangles shown; rejects with "model_needs_draco" and the like.
+   */
+  async setModelLayer(opts: ModelLayerOptions | null): Promise<number> {
+    const load = ++this.modelLoad;
+    if (!opts?.files.length) {
+      this.modelParts = null;
+      this.modelOpts = null;
+      this.buildModel();
+      return 0;
+    }
+    const files = await Promise.all(
+      opts.files.map(async (f) => {
+        const res = await fetch(f.url, { credentials: "same-origin" });
+        if (!res.ok) throw new Error(`model_http_${res.status}`);
+        return { file: f, bytes: new Uint8Array(await res.arrayBuffer()) };
+      }),
+    );
+    const decoder = files.some((f) => needsMeshopt(f.bytes)) ? await loadMeshopt() : null;
+    const parts: ModelPart[] = [];
+    for (const { file, bytes } of files) for (const p of readModel(bytes, decoder)) parts.push(file.floorId ? { ...p, floorId: file.floorId } : p);
+    if (load !== this.modelLoad || this.disposed) return 0;
+    this.modelParts = parts;
+    this.modelOpts = opts;
+    this.modelSig = "";
+    this.buildModel();
+    return this.model?.triangles ?? 0;
+  }
+
+  /** Sorts the model's parts onto the plan's floors again when those changed; otherwise only its colours follow the style. */
+  private buildModel(): void {
+    const b = this.building;
+    const parts = this.modelParts;
+    if (!parts || !this.modelOpts || !b) {
+      this.model?.dispose();
+      this.model = null;
+      this.modelSig = "";
+      return;
+    }
+    const floors = b.floors.map((f) => ({ id: f.id, name: f.name, elevation: f.elevation, height: f.height }));
+    const sig = JSON.stringify([floors, this.lowQuality]);
+    if (sig !== this.modelSig || !this.model) {
+      this.model?.dispose();
+      this.model = new ModelLayer(parts, this.modelOpts, floors, { theme: this.themeUniform, lineBlending: lineBlending(this.theme), low: this.lowQuality });
+      this.modelSig = sig;
+      this.root.add(this.model.group);
+      this.renderer.localClippingEnabled = true;
+    } else this.model.restyle();
+    for (const fv of this.floors) this.model.placeFloor(fv.floor.id, fv.group.position.y, fv.o);
+    this.applyModelCut();
+    this.invalidate();
+  }
+
+  /** What of the model reaches above the opened floor is cut away (the floors above fly off with their parts). */
+  private applyModelCut(): void {
+    const sel = this.floorId ? this.floorMap.get(this.floorId) : undefined;
+    this.model?.setCut(sel ? sel.floor.elevation + sel.floor.height : null);
   }
 
   private buildRoofMesh(): void {
@@ -3336,6 +3415,7 @@ export class FloorplanViewer {
       }
       this.applyFloor(fv);
     }
+    this.applyModelCut();
     this.invalidate();
   }
 
@@ -3343,6 +3423,8 @@ export class FloorplanViewer {
   private applyFloor(fv: FloorView): void {
     fv.group.position.y = fv.floor.elevation + fv.y;
     fv.group.visible = fv.o > 0.02;
+    // the model layer's parts of this floor rise, fade and fan out with it
+    this.model?.placeFloor(fv.floor.id, fv.group.position.y, fv.o);
     // a multiply layer cannot fade, so it goes with the first step; the tablet level leaves it out
     fv.shadowMesh.visible = fv.o > 0.98 && !this.lowQuality;
     if (Math.abs(fv.appliedO - fv.o) < 1e-3) return;

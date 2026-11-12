@@ -116,7 +116,7 @@ import { getPacks, isPackCooktop, isPackHeater, isPackType, isRobotVacuum, mount
 import { parkedVehicle, PRESENT_STATES, parkedVehicles, vehicleFurniture } from "../parking.ts";
 import { TRAIL_ICON, TRAIL_WINDOW_MS, trailEvents, trailPoints, trailSources, trailTime, type HistoryRow } from "../trail.ts";
 import { limitEffects, weatherEntity, weatherState } from "../weather.ts";
-import { SHOW_PRESENCE } from "../flags.ts";
+import { MODEL_LAYER, SHOW_PRESENCE } from "../flags.ts";
 import { hasFeature, manualUrl, projectionOn, released, shopUrl, type Feature } from "../features.ts";
 import { searchIndex, searchItems, type SearchItem } from "../search.ts";
 import type { Shown } from "../voice/targets.ts";
@@ -1053,6 +1053,15 @@ export class Fp3dView3d extends LitElement {
         this.shownStartView = JSON.stringify(this.startViewOf());
         this.viewer.setStartView(this.startViewOf());
         this.viewer.setBuilding(this.shownBuilding()!);
+      }
+      if (MODEL_LAYER) {
+        let opts = null;
+        try {
+          opts = JSON.parse(localStorage.getItem("neonplan3d-model-layer") ?? "null");
+        } catch {
+          // no model configured
+        }
+        if (opts) void this.viewer.setModelLayer(opts).then((n) => console.info(`NeonPlan model layer: ${n} triangles`), (e: unknown) => console.warn("NeonPlan model layer:", e));
       }
       this.scheduleThumbs();
       this.syncDevices(true);
