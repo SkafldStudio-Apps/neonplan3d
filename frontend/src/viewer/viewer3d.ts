@@ -8,7 +8,7 @@
 import { AdditiveBlending, CustomBlending, OneFactor, SrcAlphaFactor, ZeroFactor, RingGeometry, Fog, CircleGeometry, Box3, CanvasTexture, ClampToEdgeWrapping, Color, BackSide, DoubleSide, FrontSide, Group, LineBasicMaterial, LineSegments, Mesh, MeshBasicMaterial, MultiplyBlending, OrthographicCamera, PerspectiveCamera, Points, PointsMaterial, PlaneGeometry, Raycaster, RepeatWrapping, Scene, SRGBColorSpace, TextureLoader, type Texture, Float32BufferAttribute, Uint32BufferAttribute, DynamicDrawUsage, BufferGeometry as Geometry, Vector2, Vector3, WebGLRenderer, WebGLRenderTarget, type Material, BufferGeometry } from "three";
 import type { Building, Floor, Furniture, Room, StartView } from "../model.ts";
 import { recolorLamps, SHADE_SENTINEL, shadeFactors } from "./lamp-colors.ts";
-import { centroid, GANG_TYPES, gateSpans, outdoorSurface, outdoorTopAt, outdoorZones, pointInPolygon, openingStyle, setTerrain, WALL_LAMP_Y, zonesOf } from "../model.ts";
+import { centroid, polygonArea, GANG_TYPES, gateSpans, outdoorSurface, outdoorTopAt, outdoorZones, pointInPolygon, openingStyle, setTerrain, WALL_LAMP_Y, zonesOf } from "../model.ts";
 import { placeWallPlate } from "../geometry/walls.ts";
 import { buildEarth } from "./earth.ts";
 import { clampIntoRoom } from "../geometry/snap.ts";
@@ -21,6 +21,7 @@ import { packGlowCentre, packGlowCentres, pushAwning, pushCameraModel, pushPackG
 import { pushPipeTube, type PipeTube } from "./pipes.ts";
 import { pushGate } from "./outdoor.ts";
 import { pinKey } from "./pin-key.ts";
+import { roomLabelsShown } from "./label-room.ts";
 // the walk through the house at eye height (lives with the viewer it drives)
 export { FloorMap, WalkCamera, type WalkState } from "./walk.ts";
 
@@ -504,7 +505,8 @@ interface FloorView {
   lampRanges: Map<string, { start: number; end: number }>;
   /** Room box and room labels with their centres, so labels are placed without recomputing them. */
   bbox: { x0: number; x1: number; z0: number; z1: number } | null;
-  roomPins: { pin: HTMLButtonElement; room: Room; cx: number; cz: number }[];
+  /** `area` ranks the label where labels would cover each other; `size` is measured once per text and stage size. */
+  roomPins: { pin: HTMLButtonElement; room: Room; cx: number; cz: number; area: number; size: { w: number; h: number } | null }[];
   /** Size of the floor label, measured once per text (reading it every frame forces a layout). */
   labelSize: { w: number; h: number } | null;
   materials: FloorMaterials;
@@ -824,6 +826,8 @@ export class FloorplanViewer {
       });
       this.intersection.observe(host);
     }
+    // labels measured before the web fonts arrived are too narrow for giving way to each other
+    void document.fonts?.ready.then(() => this.remeasureLabels());
     this.resize();
   }
 
@@ -2078,7 +2082,20 @@ export class FloorplanViewer {
     const same = info.size === this.roomInfo.size && [...info].every(([k, v]) => this.roomInfo.get(k) === v);
     if (same) return;
     this.roomInfo = info;
-    for (const fv of this.floors) for (const rp of fv.roomPins) this.fillRoomPin(rp.pin, rp.room.name, info.get(rp.room.id));
+    for (const fv of this.floors) {
+      for (const rp of fv.roomPins) {
+        this.fillRoomPin(rp.pin, rp.room.name, info.get(rp.room.id));
+        rp.size = null;
+      }
+    }
+    this.labelsDirty = true;
+  }
+
+  /** The room labels changed size (symbol size, fonts): they are measured again before they give way to each other. */
+  remeasureLabels(): void {
+    for (const fv of this.floors) for (const rp of fv.roomPins) rp.size = null;
+    this.labelsDirty = true;
+    this.invalidate();
   }
 
   /** Text under the floor names in the house view, e.g. "5 rooms · 3 lights on · 1 open". */
@@ -2418,6 +2435,8 @@ export class FloorplanViewer {
     const w = this.host.clientWidth || 1;
     const h = this.host.clientHeight || 1;
     this.size = { w, h };
+    // a stage of another width may scale the labels (narrow screens): measured again
+    for (const fv of this.floors) for (const rp of fv.roomPins) rp.size = null;
     this.labelsDirty = true;
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
@@ -2980,7 +2999,7 @@ export class FloorplanViewer {
         pin.addEventListener("click", () => this.options.onRoomTap?.(floor.id, room.id));
         this.labels.append(pin);
         const [cx, cz] = centroid(room.points);
-        roomPins.push({ pin, room, cx, cz });
+        roomPins.push({ pin, room, cx, cz, area: polygonArea(room.points), size: null });
         if (room.outdoor) continue;
         for (const [x, z] of room.points) {
           bbox ??= { x0: x, x1: x, z0: z, z1: z };
@@ -5565,6 +5584,7 @@ export class FloorplanViewer {
       });
     }
     this.updateDevicePins(w, h);
+    const shown: { rp: FloorView["roomPins"][number]; x: number; y: number }[] = [];
     for (const fv of this.floors) {
       // in the house view, room labels would pile up between the floors; in a room its panel names it;
       // floors stacked below an opened floor carry no labels
@@ -5577,9 +5597,18 @@ export class FloorplanViewer {
         }
         v.set(rp.cx, y, rp.cz).project(this.camera);
         const off = v.z > 1 || Math.abs(v.x) > 1.1 || Math.abs(v.y) > 1.1;
-        this.place(rp.pin, off ? null : `translate(${((v.x + 1) / 2) * w}px, ${((1 - v.y) / 2) * h}px) translate(-50%, -50%)`);
+        if (off) this.place(rp.pin, null);
+        else shown.push({ rp, x: ((v.x + 1) / 2) * w, y: ((1 - v.y) / 2) * h });
       }
     }
+    // labels never measured are shown first and then all read at once: one layout, not one per label
+    const fresh = shown.filter((s) => !s.rp.size);
+    for (const s of fresh) if (s.rp.pin.hidden) s.rp.pin.hidden = false;
+    // (a stage not laid out yet measures 0: measured again next time)
+    for (const s of fresh) if (s.rp.pin.offsetWidth) s.rp.size = { w: s.rp.pin.offsetWidth, h: s.rp.pin.offsetHeight };
+    // where labels would cover each other (a dense house, closets and WCs), the bigger room keeps its name
+    const keep = roomLabelsShown(shown.map((s) => ({ x: s.x, y: s.y, w: s.rp.size?.w ?? 0, h: s.rp.size?.h ?? 0, rank: s.rp.area })));
+    shown.forEach((s, i) => this.place(s.rp.pin, keep[i] ? `translate(${s.x}px, ${s.y}px) translate(-50%, -50%)` : null));
   }
 
   /** A floor other than the opened one (shown below it when floors are stacked). */

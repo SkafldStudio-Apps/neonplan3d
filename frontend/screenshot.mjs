@@ -77,6 +77,28 @@ const FARM_SCRIPT = `
   e.setDoc(b);
 `;
 
+// a dense plan (invented): 40 rooms on the ground floor, most of them closets and WCs with long names, and 5 rooms
+// upstairs; room names must not pile up into a stack (labels that would cover each other give way)
+const DENSE_SCRIPT = `
+  const b = structuredClone(e._doc);
+  const eg = b.floors[0];
+  const og = b.floors[1];
+  const R = (id, name, x0, z0, x1, z1) => ({ id, name, area_id: null, points: [[x0, z0], [x1, z0], [x1, z1], [x0, z1]], floor_material: "tiles" });
+  for (const f of [eg, og]) Object.assign(f, { openings: [], furniture: [], placements: [], outdoor: [], walls: [], background: null });
+  const names = ["CLÓSET DE BOMBA DE PISCINA", "BAÑO DE VISITAS", "CUARTO DE LAVADO", "BODEGA DE HERRAMIENTAS", "VESTIDOR PRINCIPAL", "CLÓSET DE BLANCOS", "CUARTO DE MÁQUINAS", "DESPENSA"];
+  eg.rooms = [R("sala", "SALA Y COMEDOR", 0, 0, 10, 7), R("cocina", "COCINA", 10, 0, 16, 7)];
+  let n = 0;
+  for (let row = 0; row < 4; row++) for (let col = 0; col < 8; col++) {
+    const x0 = col * 2, z0 = 7 + row * 1.6;
+    eg.rooms.push(R("r" + n, names[n % names.length] + " " + (n + 1), x0, z0, x0 + 2, z0 + 1.6));
+    n++;
+  }
+  for (let i = 0; i < 6; i++) eg.rooms.push(R("w" + i, "WC " + (i + 1), 16, i * 2.2, 18, i * 2.2 + 2.2));
+  og.rooms = [R("rec1", "RECÁMARA PRINCIPAL", 0, 0, 8, 7), R("rec2", "RECÁMARA 2", 8, 0, 16, 7), R("bano", "BAÑO COMPLETO", 0, 7, 4, 10), R("estudio", "ESTUDIO", 4, 7, 10, 10), R("terraza", "ESTANCIA FAMILIAR", 10, 7, 16, 10)];
+  b.settings.roof = { type: "none", pitch: 30, overhang: 0.4, sections: [] };
+  e.setDoc(b);
+`;
+
 // the farmhouse with 42 cm outer walls and a glass terrace roof flush with the house's outer wall face (#863):
 // the roof stops at the wall instead of poking through it
 const TERRACE_SCRIPT = FARM_SCRIPT + `
@@ -249,6 +271,9 @@ const shots = [
   { name: "editor-roof-overview", query: "", width: 1280, height: 900, editor: true, editorScript: FARM_SCRIPT + "e._floorId = e._doc.floors[0].id; e._tool = 'roof'; e._roofId = null; setTimeout(() => e.fit(), 300);" },
   { name: "view-roof-proposal", query: "", width: 1280, height: 800, editor: true, editorScript: FARM_SCRIPT + "setTimeout(() => { e._doc.settings.roof.sections = []; e.useRoofSections(); }, 300);", then3d: "Alle Etagen", then3dAlso: "Gestapelt", camera: { theta: 2.3, phi: 0.95, radius: 52 } },
   { name: "editor-split-wall", query: "", width: 1400, height: 900, editor: true, editorScript: "const r = e._doc.floors[0].rooms.find((x) => x.id === 'wohnen'); r.wall_splits = [[2.2], null, null, null]; r.wall_heights = [[1.1, null], null, null, null]; e.setDoc(structuredClone(e._doc)); e._roomId = 'wohnen'; e._tool = 'select'; setTimeout(() => e.renderRoot.querySelector('aside')?.scrollTo(0, 500), 400);", afterWait: 1200 },
+  { name: "view-dense-house", query: "", width: 1280, height: 800, editor: true, editorScript: DENSE_SCRIPT, afterWait: 1000, then3d: "Alle Etagen" },
+  { name: "view-dense-eg", query: "", width: 1280, height: 800, editor: true, editorScript: DENSE_SCRIPT, afterWait: 1000, then3d: "Erdgeschoss" },
+  { name: "view-dense-single", query: "", width: 1280, height: 800, editor: true, editorScript: DENSE_SCRIPT.replace("e.setDoc(b);", "b.floors = [eg]; e.setDoc(b);"), afterWait: 1000, then3d: "Alle Etagen" },
   { name: "view-flat-outline", query: "", width: 1280, height: 800, editor: true, editorScript: "e._doc.floors = e._doc.floors.filter((f) => f.id === 'eg'); e._doc.settings.roof.sections = []; e.setDoc(structuredClone(e._doc)); e._floorId = 'eg'; setTimeout(() => { e.useRoofSections(); setTimeout(() => { const sec = e._doc.settings.roof.sections[0]; e._tool = 'roof'; e._roofId = sec.id; e.updateRoofSection({ shape: 'flat', eave_a: 2.95, eave_b: 2.95, base: 2.95 }); e.takeRoofOutline(); }, 500); }, 300);", afterWait: 2000, then3d: "Alle Etagen", then3dAlso: ["Gestapelt"], camera: { theta: 0.8, phi: 1.0, radius: 24 } },
   { name: "editor-flat-outline", query: "", width: 1400, height: 900, editor: true, editorScript: "e._doc.floors = e._doc.floors.filter((f) => f.id === 'eg'); e._doc.settings.roof.sections = []; e.setDoc(structuredClone(e._doc)); e._floorId = 'eg'; setTimeout(() => { e.useRoofSections(); setTimeout(() => { const sec = e._doc.settings.roof.sections[0]; e._tool = 'roof'; e._roofId = sec.id; e.updateRoofSection({ shape: 'flat', eave_a: 2.95, eave_b: 2.95, base: 2.95 }); e.takeRoofOutline(); setTimeout(() => e.fit(), 300); }, 500); }, 300);", afterWait: 2500 },
   { name: "view-roof-halfhip", query: "", width: 1280, height: 800, editor: true, editorScript: "e.useRoofSections(); setTimeout(() => { const secs = e._doc.settings.roof.sections; const big = [...secs].sort((p, q) => Math.abs((q.x1 - q.x0) * (q.z1 - q.z0)) - Math.abs((p.x1 - p.x0) * (p.z1 - p.z0)))[0]; e._tool = 'roof'; e._roofId = big.id; e.updateRoofSection({ shape: 'halfhip', pitch_a: 42, pitch_b: 42 }); }, 700);", afterWait: 1500, then3d: "Alle Etagen", then3dAlso: ["Gestapelt"], camera: { theta: 0.9, phi: 1.0, radius: 26 } },

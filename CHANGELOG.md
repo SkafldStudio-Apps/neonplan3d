@@ -4,6 +4,11 @@ All notable changes to NeonPlan 3D. The full notes in German and English are on 
 [releases page](https://github.com/Mastershort/neonplan3d/releases). Ideas and votes:
 [Discussions → Ideas](https://github.com/Mastershort/neonplan3d/discussions/categories/ideas).
 
+## 3.1.2
+
+### Fixed
+- **Room names in the 3D view:** on a floor with many rooms (or a plan with only one floor) the names no longer pile up on top of each other. Where two names would overlap, the bigger room keeps its name and the smaller one gives way; turn or zoom and they come back. Small houses look the same as before; every room stays reachable through the room chips.
+
 ## 3.1.1
 
 ### Fixed
