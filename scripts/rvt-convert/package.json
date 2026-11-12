@@ -1,0 +1,16 @@
+{
+  "name": "neonplan3d-rvt-convert",
+  "private": true,
+  "type": "module",
+  "description": "Revit (.rvt) to per-level GLB + rooms.json via Autodesk Platform Services. Not part of the integration build.",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@gltf-transform/core": "^4.5.1",
+    "@gltf-transform/extensions": "^4.5.1",
+    "@gltf-transform/functions": "^4.5.1",
+    "meshoptimizer": "^1.3.0",
+    "svf-utils": "8.0.0"
+  }
+}
