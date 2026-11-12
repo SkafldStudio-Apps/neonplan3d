@@ -39,6 +39,55 @@ export function guessRole(name: string): LayerRole {
   return "ignore";
 }
 
+/** The bounding box of points, in a loop (spreading a large drawing into Math.min/max overflows the stack). */
+export function extent(pts: readonly Vec2[]): { x0: number; y0: number; x1: number; y1: number } {
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (const [x, y] of pts) {
+    if (x < x0) x0 = x;
+    if (x > x1) x1 = x;
+    if (y < y0) y0 = y;
+    if (y > y1) y1 = y;
+  }
+  return { x0, y0, x1, y1 };
+}
+
+/**
+ * Whether a block is a door or a window: told by its name, else by the layers it is drawn on (Revit names blocks
+ * after the family, e.g. "GGA_WN_PANORAMAH_6 PANEL SLIDER", but draws a window on the glazing layer). Tags and
+ * details that merely show a door or window are none.
+ */
+export function blockRole(name: string, inner: readonly { layer: string }[], layerRole: (layer: string) => LayerRole): "door" | "window" | null {
+  if (/(^|[^a-z])(tags?|iden)([^a-z]|$)|jamb|detail/i.test(name)) return null;
+  const byName = guessRole(name);
+  if (byName === "door" || byName === "window") return byName;
+  let doors = 0;
+  let windows = 0;
+  for (const e of inner) {
+    const r = layerRole(e.layer);
+    if (r === "door") doors++;
+    else if (r === "window") windows++;
+  }
+  if (!doors && !windows) return null;
+  if (doors + windows < inner.length / 2) return null;
+  return windows > doors ? "window" : "door";
+}
+
+/** The nominal size a block's name gives in millimetres ("900mm X 2450mm", "1150 X 1850", "2750 H"), in metres. */
+export function sizeFromName(name: string): { width: number | null; height: number | null } {
+  const wh = /(\d{3,4})\s*(?:mm)?\s*[x×]\s*(\d{3,4})\s*(?:mm)?/i.exec(name);
+  if (wh) {
+    const width = parseInt(wh[1], 10) / 1000;
+    const height = parseInt(wh[2], 10) / 1000;
+    if (width >= 0.3 && width <= 8 && height >= 0.3 && height <= 4.5) return { width, height };
+  }
+  const h = /(\d{4})\s*H\b/.exec(name);
+  const height = h ? parseInt(h[1], 10) / 1000 : null;
+  return { width: null, height: height !== null && height >= 0.3 && height <= 4.5 ? height : null };
+}
+
 /** The group code / value pairs of a DXF text. */
 function pairs(text: string): [number, string][] {
   const lines = text.split(/\r?\n/);
@@ -144,7 +193,9 @@ export function readDxf(text: string, roles: Record<string, LayerRole> = {}, uni
 
   // block references: a door or window block becomes an opening, any other block is drawn out (walls in blocks)
   const flat: Entity[] = [];
-  const openings: { kind: "door" | "window"; at: Vec2; width: number }[] = [];
+  /** width in drawing units; nominal sizes (from the block's name) already in metres */
+  const openings: { kind: "door" | "window"; at: Vec2; width: number; nominal: { width: number | null; height: number | null }; slides: boolean }[] = [];
+  const layerRole = (layer: string) => roles[layer] ?? guessRole(layer);
   for (const e of list) {
     if (e.type !== "INSERT" || !e.block) {
       flat.push(e);
@@ -157,16 +208,14 @@ export function readDxf(text: string, roles: Record<string, LayerRole> = {}, uni
       const sy = y * (e.sy ?? 1);
       return [(e.at?.[0] ?? 0) + sx * Math.cos(rot) - sy * Math.sin(rot), (e.at?.[1] ?? 0) + sx * Math.sin(rot) + sy * Math.cos(rot)];
     };
-    const role = guessRole(e.block);
-    const pts = inner.flatMap((x) => x.pts).map(tf);
-    if ((role === "door" || role === "window") && pts.length) {
-      // its width: the longer side of the block's extent
-      const xs = inner.flatMap((x) => x.pts).map((q) => q[0] * Math.abs(e.sx ?? 1));
-      const ys = inner.flatMap((x) => x.pts).map((q) => q[1] * Math.abs(e.sy ?? 1));
-      const width = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
-      const cx = pts.reduce((s, q) => s + q[0], 0) / pts.length;
-      const cy = pts.reduce((s, q) => s + q[1], 0) / pts.length;
-      openings.push({ kind: role, at: [cx, cy], width });
+    const role = blockRole(e.block, inner.map((x) => ({ layer: x.layer === "0" ? e.layer : x.layer })), layerRole);
+    const own = inner.flatMap((x) => x.pts);
+    if (role && own.length) {
+      // its width: the longer side of the block's extent; its place: the middle of that extent
+      const box = extent(own.map((q) => [q[0] * Math.abs(e.sx ?? 1), q[1] * Math.abs(e.sy ?? 1)] as Vec2));
+      const width = Math.max(box.x1 - box.x0, box.y1 - box.y0);
+      const placed = extent(own.map(tf));
+      openings.push({ kind: role, at: [(placed.x0 + placed.x1) / 2, (placed.y0 + placed.y1) / 2], width, nominal: sizeFromName(e.block), slides: /slid|schiebe|corredera|scorrevol|coulissant/i.test(e.block) });
       continue;
     }
     for (const x of inner) flat.push({ ...x, layer: x.layer === "0" ? e.layer : x.layer, pts: x.pts.map(tf), at: x.at ? tf(x.at) : undefined });
@@ -182,7 +231,8 @@ export function readDxf(text: string, roles: Record<string, LayerRole> = {}, uni
 
   // units: the header, else guessed from the size of the drawing (a house spans 5–40 m)
   const all = flat.flatMap((e) => e.pts);
-  const span = all.length ? Math.max(Math.max(...all.map((q) => q[0])) - Math.min(...all.map((q) => q[0])), Math.max(...all.map((q) => q[1])) - Math.min(...all.map((q) => q[1]))) : 0;
+  const box = extent(all);
+  const span = all.length ? Math.max(box.x1 - box.x0, box.y1 - box.y0) : 0;
   const fromHeader: Record<number, number> = { 1: 0.0254, 2: 0.3048, 4: 0.001, 5: 0.01, 6: 1 };
   const u = unit ?? fromHeader[insUnits] ?? (span > 2500 ? 0.001 : span > 150 ? 0.01 : 1);
   // DXF y runs up the drawing, NeonPlan's z down the plan
@@ -214,7 +264,16 @@ export function readDxf(text: string, roles: Record<string, LayerRole> = {}, uni
     elevation: 0,
     rooms,
     walls,
-    openings: openings.map((o) => ({ kind: o.kind, at: m(o.at), width: o.width * u, height: o.kind === "door" ? 2.01 : 1.3, sill: o.kind === "door" ? 0 : 0.9 })),
+    openings: openings
+      .map((o) => {
+        const width = o.nominal.width ?? o.width * u;
+        // a sliding window is a glass door; a window as tall as a door stands on the floor too (a glass wall),
+        // any other sits at sill height
+        const height = o.nominal.height ?? (o.kind === "door" || o.slides ? 2.01 : 1.3);
+        return { kind: o.kind, at: m(o.at), width, height, sill: o.kind === "door" || height >= 2 ? 0 : 0.9 };
+      })
+      // a marker or a stray symbol on the door or glazing layer is no opening
+      .filter((o) => o.width >= 0.3),
     furniture: [],
     labels: texts,
   };

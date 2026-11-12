@@ -4,6 +4,13 @@ All notable changes to NeonPlan 3D. The full notes in German and English are on 
 [releases page](https://github.com/Mastershort/neonplan3d/releases). Ideas and votes:
 [Discussions → Ideas](https://github.com/Mastershort/neonplan3d/discussions/categories/ideas).
 
+## 3.1.1
+
+### Fixed
+- **CAD import (DXF) from Revit and other programs:** windows and doors are found by the layer their block is drawn on, not only by its name, so blocks named after their family (e.g. Revit's "PANEL SLIDER" or "CASEMENT") come in as windows. Sizes in the block name ("900mm X 2450mm", "1150 X 1850", "2750 H") are used; sliding windows stand on the floor; window tags and details are skipped.
+- **CAD import:** a door or window whose symbol sits a little off the wall line (a door swing, a deep sill) lands on the nearest room edge instead of being dropped.
+- **CAD import:** large drawings no longer stop the import with an error.
+
 ## 3.1.0
 
 **Neon was just the beginning – your home in every style.**

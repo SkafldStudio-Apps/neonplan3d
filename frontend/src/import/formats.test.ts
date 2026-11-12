@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { readDxf, guessRole } from "./dxf.ts";
+import { readDxf, guessRole, blockRole, sizeFromName } from "./dxf.ts";
 import { readValetudo, isValetudo } from "./valetudo.ts";
 import { readFloorplanner, isFloorplanner } from "./floorplanner.ts";
 import { buildPlan } from "./builder.ts";
@@ -48,6 +48,109 @@ test("a DXF with walls as two faces: units guessed, rooms found and joined, the 
   assert.equal(stats.doors, 1);
   assert.equal(f.openings[0].width, 0.9);
   assert.equal(b.settings.wall_interior, 0.12);
+});
+
+// a DXF as Revit exports it, in millimetres: rooms on the area layer, walls as two faces, doors and windows as
+// blocks named after their families and drawn on the door and glazing layers
+function revitDxf(): string {
+  const out: string[] = ["0", "SECTION", "2", "HEADER", "9", "$INSUNITS", "70", "4", "0", "ENDSEC", "0", "SECTION", "2", "BLOCKS"];
+  const line = (layer: string, x1: number, y1: number, x2: number, y2: number) => out.push("0", "LINE", "8", layer, "10", String(x1), "20", String(y1), "11", String(x2), "21", String(y2));
+  const block = (name: string, draw: () => void) => {
+    out.push("0", "BLOCK", "2", name, "10", "0", "20", "0");
+    draw();
+    out.push("0", "ENDBLK");
+  };
+  // a casement window: frame lines on both wall faces, 1150 mm wide, its size in the name
+  block("GGA_WN_PANORAMAH_SINGLE CASEMENT - 1150 X 1850-8536643-LEVEL 01", () => {
+    line("A-GLAZ", -575, 0, 575, 0);
+    line("A-GLAZ", -575, -150, 575, -150);
+  });
+  // a slider as tall as a door, 3 m wide, only its height in the name
+  block("GGA_WN_PANORAMAH_6 PANEL SLIDER - 2750 H-7020893-LEVEL 01", () => {
+    line("A-GLAZ", -1500, 0, 1500, 0);
+    line("A-GLAZ", -1500, -150, 1500, -150);
+  });
+  // a sliding window with no height in its name: a glass door, on the floor
+  block("GGA_WN_PANORAMAH_2 PANEL SLIDER_HOSTED 2 - BEDROOM 4-9597144-LEVEL 01", () => {
+    line("A-GLAZ", -1000, 0, 1000, 0);
+    line("A-GLAZ", -1000, -150, 1000, -150);
+  });
+  // a door with its leaf drawn open into the room: the block's middle sits well off the wall line
+  block("2511_Typ Interior Door - Typ_900mm X 2450mm-9900578-LEVEL 01", () => {
+    line("A-DOOR", -450, 0, 450, 0);
+    line("A-DOOR", -450, 150, 450, 150);
+    line("A-DOOR", -450, 0, -450, -900);
+  });
+  // a window tag: drawn on the glazing layer, but no window
+  block("GGA_TAG_WINDOW-5", () => {
+    line("A-GLAZ", 0, 0, 340, 0);
+    line("A-GLAZ", 340, 0, 340, 340);
+  });
+  out.push("0", "ENDSEC", "0", "SECTION", "2", "ENTITIES");
+  const poly = (layer: string, pts: number[][]) => {
+    out.push("0", "LWPOLYLINE", "8", layer, "90", String(pts.length), "70", "1");
+    for (const [x, y] of pts) out.push("10", String(x), "20", String(y));
+  };
+  poly("A-AREA-BNDY", [[0, 0], [5000, 0], [5000, 4000], [0, 4000]]);
+  poly("A-WALL", [[-150, -150], [5150, -150], [5150, 4150], [-150, 4150]]);
+  poly("A-WALL", [[0, 0], [5000, 0], [5000, 4000], [0, 4000]]);
+  const insert = (name: string, x: number, y: number, rot = 0) => out.push("0", "INSERT", "8", "0", "2", name, "10", String(x), "20", String(y), "50", String(rot));
+  insert("GGA_WN_PANORAMAH_SINGLE CASEMENT - 1150 X 1850-8536643-LEVEL 01", 2500, 0);
+  insert("GGA_WN_PANORAMAH_6 PANEL SLIDER - 2750 H-7020893-LEVEL 01", 5000, 2000, 90);
+  insert("2511_Typ Interior Door - Typ_900mm X 2450mm-9900578-LEVEL 01", 1500, 4000);
+  insert("GGA_WN_PANORAMAH_2 PANEL SLIDER_HOSTED 2 - BEDROOM 4-9597144-LEVEL 01", 0, 2000, 270);
+  insert("GGA_TAG_WINDOW-5", 2500, -1000);
+  out.push("0", "ENDSEC", "0", "EOF");
+  return out.join("\n");
+}
+
+test("a Revit DXF: family-named blocks on the glazing and door layers become windows and doors with their sizes", () => {
+  const read = readDxf(revitDxf(), {}, null, "en");
+  assert.equal(read.unit, 0.001);
+  const ops = read.plan.floors[0].openings.map((o) => ({ kind: o.kind, width: Math.round(o.width * 100) / 100, height: o.height, sill: o.sill }));
+  assert.deepEqual(
+    ops.sort((a, b) => a.width - b.width),
+    [
+      { kind: "door", width: 0.9, height: 2.45, sill: 0 },
+      { kind: "window", width: 1.15, height: 1.85, sill: 0.9 },
+      { kind: "window", width: 2, height: 2.01, sill: 0 },
+      { kind: "window", width: 3, height: 2.75, sill: 0 },
+    ],
+  );
+  // all of them end up on the room's edges, the door too although its leaf pulls its middle 0.375 m into the room
+  const { building: b, stats, warnings } = buildPlan(read.plan, { lang: "en" });
+  assert.equal(stats.windows, 3);
+  assert.equal(stats.doors, 1);
+  assert.deepEqual(warnings.filter((w) => w.code === "openings_dropped"), []);
+  assert.equal(b.floors[0].openings.find((o) => o.type === "door")?.width, 0.9);
+});
+
+test("block roles: by name, else by the layers drawn on; tags and details are none", () => {
+  const roleOf = (l: string) => guessRole(l);
+  assert.equal(blockRole("Fenster 1", [], roleOf), "window");
+  assert.equal(blockRole("GGA_WN_FIXED", [{ layer: "A-GLAZ" }, { layer: "A-GLAZ" }, { layer: "0" }], roleOf), "window");
+  assert.equal(blockRole("M_Single-Flush", [{ layer: "A-DOOR" }, { layer: "A-DOOR" }], roleOf), "door");
+  assert.equal(blockRole("Sofa", [{ layer: "A-FURN" }, { layer: "A-GLAZ" }, { layer: "A-FURN" }], roleOf), null);
+  assert.equal(blockRole("GGA_TAG_WINDOW", [{ layer: "A-GLAZ" }], roleOf), null);
+  assert.equal(blockRole("Jamb Detail - Jamb Detail-9320101", [{ layer: "A-GLAZ" }], roleOf), null);
+  assert.equal(blockRole("A-GLAZ-IDEN 12", [{ layer: "A-GLAZ" }], roleOf), null);
+  // "Residential" holds "iden" but is no identity tag
+  assert.equal(blockRole("Residential Entry - 1000mm X 2450mm", [{ layer: "A-DOOR" }], roleOf), "door");
+  assert.equal(blockRole("Empty", [], roleOf), null);
+});
+
+test("nominal sizes from block names", () => {
+  assert.deepEqual(sizeFromName("2511_Typ Interior Door - Typ_900mm X 2450mm-9900578"), { width: 0.9, height: 2.45 });
+  assert.deepEqual(sizeFromName("SINGLE CASEMENT - 1150 X 1850-8536643"), { width: 1.15, height: 1.85 });
+  assert.deepEqual(sizeFromName("6 PANEL SLIDER - 2750 H-7020893"), { width: null, height: 2.75 });
+  assert.deepEqual(sizeFromName("FIXED WINDOW - Living Room-6552641"), { width: null, height: null });
+});
+
+test("a large DXF does not overflow the stack", () => {
+  const out: string[] = ["0", "SECTION", "2", "ENTITIES"];
+  for (let i = 0; i < 200_000; i++) out.push("0", "LINE", "8", "A-WALL", "10", String(i % 1000), "20", String(i % 777), "11", String((i % 1000) + 5), "21", String(i % 777));
+  out.push("0", "ENDSEC", "0", "EOF");
+  assert.doesNotThrow(() => readDxf(out.join("\n")));
 });
 
 test("layer roles are guessed from their names", () => {

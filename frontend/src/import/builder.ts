@@ -183,8 +183,13 @@ export function buildPlan(raw: RawPlan, options: BuildOptions = {}): BuildResult
 
   // the plan moved so it starts near the origin (other programs often keep large offsets)
   const all: Vec2[] = floorsIn.flatMap((f) => [...f.rooms.flatMap((r) => r.points), ...f.walls.flatMap((w) => [w.a, w.b])]);
-  const minX = all.length ? Math.min(...all.map((p) => p[0])) : 0;
-  const minZ = all.length ? Math.min(...all.map((p) => p[1])) : 0;
+  // (in a loop: a large CAD drawing spread into Math.min overflows the stack)
+  let minX = all.length ? Infinity : 0;
+  let minZ = all.length ? Infinity : 0;
+  for (const p of all) {
+    if (p[0] < minX) minX = p[0];
+    if (p[1] < minZ) minZ = p[1];
+  }
   const shift = (p: Vec2): Vec2 => [r3(p[0] - minX), r3(p[1] - minZ)];
 
   const thickAll = floorsIn.flatMap((f) => f.walls.map((w) => w.thickness ?? NaN)).filter((t) => t > 0.03 && t < 1);
@@ -315,6 +320,13 @@ export function buildPlan(raw: RawPlan, options: BuildOptions = {}): BuildResult
         }
         if (best && !rooms.length) best = null;
       }
+      // a drawn door or window symbol whose middle sits off the wall line (a deep sill, a door swing, a frame
+      // drawn to one side) still belongs on the nearest room edge, as long as one is close
+      if (!best && o.kind)
+        for (const e of edges) {
+          const m = toSegment(at, e.a, e.b);
+          if (m.d <= 1 && m.s > -0.05 && m.s < m.len + 0.05 && (!best || m.d < best.d)) best = { room: e.room, edge: e.edge, s: m.s, len: m.len, d: m.d };
+        }
       if (!best) {
         dropped++;
         continue;
